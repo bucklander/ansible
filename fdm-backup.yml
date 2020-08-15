@@ -1,0 +1,104 @@
+---
+# Python requirements: pip install hvac google-auth
+
+- name: Download Latest FDM Backup File and Upload to GCS Bucket for Cold Storage
+  hosts: all
+  connection: local
+  gather_facts: yes
+  vars:
+    awx_run: true
+    vault_addr: "vault-server-hostname"
+    svc_acct_user: "{{ lookup('hashi_vault', 'secret=/secret/svc_acct:user  url=https://{{vault_addr}}')  }}"
+    svc_acct_pass: "{{ lookup('hashi_vault', 'secret=/secret/svc_acct:pass  url=https://{{vault_addr}}')  }}"
+    gcs_bucket_name: "my-google-cloud-storage-backup-bucket"
+
+  tasks:
+      - name: Retrieve Vault Access Token
+      # I use Hashicorp Vault to store/retrieve user credentials. This is a simple script which sets a local
+      # environment variable on the Ansible VM enabling hashi_vault lookups
+        when: awx_run|bool
+        local_action: command ../bin/gce_vault_token.sh
+        run_once: true
+
+      - name: Retrieve GCS Access Token
+      # Note that AWX runs from a Google Cloud VM with a service account that has pre-defined IAM read/write
+      # permissions to the Google Cloud bucket. This play wont work if ran outside of a GCE environment.
+        uri:
+          url: http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token
+          validate_certs: false
+          method: GET
+          headers:
+            Metadata-Flavor: Google
+          return_content: yes
+        run_once: true
+        register: gcs_token_resp
+
+      - name: Retrieve FDM Access Token
+      # We authenticate w/ a regular AAA account on FTD to retrieve an API access token for subsequent calls
+      # Cisco documentation: http://shorturl.at/bxI39
+        uri:
+          url: https://{{ ansible_host }}/api/fdm/latest/fdm/token
+          validate_certs: false 
+          method: POST
+          body: >
+            {"grant_type":"password","username":"{{ svc_acct_user }}","password":"{{ svc_acct_pass }}"}
+          body_format: json
+          return_content: yes
+        register: fdm_token_resp
+
+      - name: Determine Firewall HA State and End Play for All Standby Units
+      # Currently FDM prevents scheduling of backup jobs on standby firewalls, so we drop those hosts off here
+        uri:
+          url: https://{{ ansible_host }}/api/fdm/latest/devices/default/operational/ha/status/default
+          validate_certs: false
+          method: GET
+          return_content: yes
+          headers:
+            Authorization: Bearer {{ fdm_token_resp.json.access_token }}
+        register: ha_resp
+      - name: End Play for Standby Units
+        meta: end_host
+        when: ha_resp.json.nodeState == 'HA_STANDBY_NODE'
+
+      - name: Retrieve List of Backup Filenames from FDM
+      # Retrieves list of latest backup files from the FDM
+        uri:
+          url: https://{{ ansible_host }}/api/fdm/latest/managedentity/archivedbackups
+          validate_certs: false
+          method: GET
+          return_content: yes
+          headers:
+            Authorization: Bearer {{ fdm_token_resp.json.access_token }}
+        register: file_resp
+
+      - name: Find and Download Latest Backup(s)
+      # Parses the list of files to download only the latest one to a temporary Ansible VM local directory
+        get_url:
+          url: https://{{ ansible_host }}/api/fdm/latest/action/downloadbackup/{{ file_resp | json_query(q) | sort(reverse=True) | first }}
+          timeout: 720
+          dest: /tmp/{{ ansible_host }}-{{ ansible_date_time.date }}-backup.tar
+          validate_certs: false
+          headers:
+            Authorization: Bearer {{ fdm_token_resp.json.access_token }}
+        vars:
+          q: "json.items[?type=='archivedbackup'].archiveName"
+
+      - name: Upload Latest Backup(s) to GCS Bucket
+      # Uploads the file downloaded in the previous step to Google Cloud Storage
+        uri:
+          url: https://storage.googleapis.com/upload/storage/v1/b/{{ gcs_bucket_name }}/o?uploadType=media&name={{ ansible_date_time.date }}-{{ inventory_hostname }}-backup.tar
+          validate_certs: false
+          timeout: 720
+          method: POST
+          src: /tmp/{{ ansible_host }}-{{ ansible_date_time.date }}-backup.tar
+          remote_src: yes
+          return_content: yes
+          headers:
+            Authorization: Bearer {{ gcs_token_resp.json.access_token }}
+            Content-Type: application/x-tar
+        ignore_errors: yes
+
+      - name: Remove Local Backup
+        file:
+          path: /tmp/{{ ansible_host }}-{{ ansible_date_time.date }}-backup
+          state: absent
