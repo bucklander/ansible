@@ -35,7 +35,7 @@
 
       - name: Retrieve FDM Access Token
       # We authenticate w/ a regular AAA account on FTD to retrieve an API access token for subsequent calls
-      # Cisco documentation: http://shorturl.at/bxI39
+      # Cisco documentation: https://bit.ly/3luVE27
         uri:
           url: https://{{ ansible_host }}/api/fdm/latest/fdm/token
           validate_certs: false 
@@ -100,5 +100,5 @@
 
       - name: Remove Local Backup
         file:
-          path: /tmp/{{ ansible_host }}-{{ ansible_date_time.date }}-backup
+          path: /tmp/{{ ansible_host }}-{{ ansible_date_time.date }}-backup.tar
           state: absent
